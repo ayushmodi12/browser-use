@@ -647,7 +647,7 @@ class Agent(Generic[Context]):
 			logger.info(f"Total step time: {time.time() - step_start_time:.2f}s")
 			
 			# Log to CSV with step number
-			log_timing_to_csv(step_timing_logs, 'service_step', self.run_id)
+			log_timing_to_csv(step_timing_logs, 'service_step', self.task_id, self.run_id)
 
 	@time_execution_async('--handle_step_error (agent)')
 	async def _handle_step_error(self, error: Exception) -> list[ActionResult]:
@@ -1095,7 +1095,7 @@ class Agent(Generic[Context]):
 			print(f"Total execution time: {time.time() - start_time:.2f}s")
 			
 			# Log to CSV with final flag
-			log_timing_to_csv(timing_logs, 'service_run', self.run_id, is_final=True)
+			log_timing_to_csv(timing_logs, 'service_run', self.task_id, self.run_id, is_final=True)
 
 	# @observe(name='controller.multi_act')
 	@time_execution_async('--multi-act (agent)')
