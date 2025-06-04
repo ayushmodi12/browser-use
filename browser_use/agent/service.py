@@ -62,6 +62,9 @@ from browser_use.telemetry.views import (
 )
 from browser_use.utils import check_env_variables, time_execution_async, time_execution_sync
 
+# Import the CSV logging utility
+from server.utils import log_timing_to_csv
+
 load_dotenv()
 logger = logging.getLogger(__name__)
 
@@ -302,7 +305,7 @@ class Agent(Generic[Context]):
 					time.sleep(10)
 				except KeyboardInterrupt:
 					print(
-						'\n\n 🛑 Exiting now... set BrowserContextConfig(allowed_domains=["example.com", "example.org"]) to only domains you trust to see your sensitive_data.'
+						'\n\n �� Exiting now... set BrowserContextConfig(allowed_domains=["example.com", "example.org"]) to only domains you trust to see your sensitive_data.'
 					)
 					sys.exit(0)
 			else:
@@ -434,37 +437,53 @@ class Agent(Generic[Context]):
 	@time_execution_async('--step (agent)')
 	async def step(self, step_info: AgentStepInfo | None = None) -> None:
 		"""Execute one step of the task"""
+		step_start_time = time.time()
+		step_timing_logs = []
+		
+		def log_step_timing(operation: str, start_time: float):
+			current_time = time.time()
+			elapsed = current_time - start_time
+			step_timing_logs.append(f"Step {operation}: {elapsed:.2f}s")
+			logger.debug(f"[Step Timing] {operation}: {elapsed:.2f}s")
+			return current_time
+
 		logger.info(f'📍 Step {self.state.n_steps}')
 		state = None
 		model_output = None
 		result: list[ActionResult] = []
-		step_start_time = time.time()
 		tokens = 0
 
 		try:
+			# Get browser state
+			state_start = time.time()
 			state = await self.browser_context.get_state(cache_clickable_elements_hashes=True)
 			current_page = await self.browser_context.get_current_page()
+			state_end = log_step_timing("Get browser state", state_start)
 
-			# generate procedural memory if needed
+			# Generate procedural memory if needed
 			if self.enable_memory and self.memory and self.state.n_steps % self.memory.config.memory_interval == 0:
+				memory_start = time.time()
 				self.memory.create_procedural_memory(self.state.n_steps)
+				memory_end = log_step_timing("Create procedural memory", memory_start)
 
 			await self._raise_if_stopped_or_paused()
 
-			# Update action models with page-specific actions
+			# Update action models
+			action_model_start = time.time()
 			await self._update_action_models_for_page(current_page)
-
-			# Get page-specific filtered actions
 			page_filtered_actions = self.controller.registry.get_prompt_description(current_page)
+			action_model_end = log_step_timing("Update action models", action_model_start)
 
-			# If there are page-specific actions, add them as a special message for this step only
+			# Add page-specific actions message
 			if page_filtered_actions:
+				page_action_start = time.time()
 				page_action_message = f'For this page, these additional actions are available:\n{page_filtered_actions}'
 				self._message_manager._add_message_with_tokens(HumanMessage(content=page_action_message))
+				page_action_end = log_step_timing("Add page actions message", page_action_start)
 
-			# If using raw tool calling method, we need to update the message context with new actions
+			# Update message context for raw tool calling
 			if self.tool_calling_method == 'raw':
-				# For raw tool calling, get all non-filtered actions plus the page-filtered ones
+				context_start = time.time()
 				all_unfiltered_actions = self.controller.registry.get_prompt_description()
 				all_actions = all_unfiltered_actions
 				if page_filtered_actions:
@@ -478,17 +497,23 @@ class Agent(Generic[Context]):
 				else:
 					updated_context = f'Available actions: {all_actions}'
 				self._message_manager.settings.message_context = updated_context
+				context_end = log_step_timing("Update message context", context_start)
 
+			# Add state message
+			state_msg_start = time.time()
 			self._message_manager.add_state_message(state, self.state.last_result, step_info, self.settings.use_vision)
+			state_msg_end = log_step_timing("Add state message", state_msg_start)
 
-			# Run planner at specified intervals if planner is configured
+			# Run planner if configured
 			if self.settings.planner_llm and self.state.n_steps % self.settings.planner_interval == 0:
+				planner_start = time.time()
 				plan = await self._run_planner()
-				# add plan before last state message
 				self._message_manager.add_plan(plan, position=-1)
+				planner_end = log_step_timing("Run planner", planner_start)
 
+			# Handle last step warning
 			if step_info and step_info.is_last_step():
-				# Add last step warning if needed
+				last_step_start = time.time()
 				msg = 'Now comes your last step. Use only the "done" action now. No other actions - so here your action sequence must have length 1.'
 				msg += '\nIf the task is not yet fully finished as requested by the user, set success in "done" to false! E.g. if not all steps are fully completed.'
 				msg += '\nIf the task is fully finished, set success in "done" to true.'
@@ -496,10 +521,16 @@ class Agent(Generic[Context]):
 				logger.info('Last step finishing up')
 				self._message_manager._add_message_with_tokens(HumanMessage(content=msg))
 				self.AgentOutput = self.DoneAgentOutput
+				last_step_end = log_step_timing("Add last step warning", last_step_start)
 
+			# Get messages and tokens
+			messages_start = time.time()
 			input_messages = self._message_manager.get_messages()
 			tokens = self._message_manager.state.history.current_tokens
+			messages_end = log_step_timing("Get messages and tokens", messages_start)
 
+			# Get next action from model
+			model_start = time.time()
 			try:
 				model_output = await self.get_next_action(input_messages)
 				if (
@@ -525,12 +556,15 @@ class Agent(Generic[Context]):
 							}
 						)
 						model_output.action = [action_instance]
+				model_end = log_step_timing("Get model output", model_start)
 
 				# Check again for paused/stopped state after getting model output
 				await self._raise_if_stopped_or_paused()
 
 				self.state.n_steps += 1
 
+				# Handle callbacks and save conversation
+				callback_start = time.time()
 				if self.register_new_step_callback:
 					if inspect.iscoroutinefunction(self.register_new_step_callback):
 						await self.register_new_step_callback(state, model_output, self.state.n_steps)
@@ -539,13 +573,17 @@ class Agent(Generic[Context]):
 				if self.settings.save_conversation_path:
 					target = self.settings.save_conversation_path + f'_{self.state.n_steps}.txt'
 					save_conversation(input_messages, model_output, target, self.settings.save_conversation_path_encoding)
+				callback_end = log_step_timing("Handle callbacks and save conversation", callback_start)
 
 				self._message_manager._remove_last_state_message()  # we dont want the whole state in the chat history
 
 				# check again if Ctrl+C was pressed before we commit the output to history
 				await self._raise_if_stopped_or_paused()
 
+				history_start = time.time()
 				self._message_manager.add_model_output(model_output)
+				history_end = log_step_timing("Add model output to history", history_start)
+
 			except asyncio.CancelledError:
 				# Task was cancelled due to Ctrl+C
 				self._message_manager._remove_last_state_message()
@@ -559,7 +597,10 @@ class Agent(Generic[Context]):
 				self._message_manager._remove_last_state_message()
 				raise e
 
+			# Execute actions
+			action_start = time.time()
 			result: list[ActionResult] = await self.multi_act(model_output.action)
+			action_end = log_step_timing("Execute actions", action_start)
 
 			self.state.last_result = result
 
@@ -598,6 +639,15 @@ class Agent(Generic[Context]):
 					input_tokens=tokens,
 				)
 				self._make_history_item(model_output, state, result, metadata)
+
+			# Log final timing summary
+			logger.info("\n=== Step Timing Summary ===")
+			for log in step_timing_logs:
+				logger.info(log)
+			logger.info(f"Total step time: {time.time() - step_start_time:.2f}s")
+			
+			# Log to CSV with step number
+			log_timing_to_csv(step_timing_logs, 'service_step', self.task_id, self.run_id)
 
 	@time_execution_async('--handle_step_error (agent)')
 	async def _handle_step_error(self, error: Exception) -> list[ActionResult]:
@@ -851,12 +901,22 @@ class Agent(Generic[Context]):
 		self, max_steps: int = 100, on_step_start: AgentHookFunc | None = None, on_step_end: AgentHookFunc | None = None
 	) -> AgentHistoryList:
 		"""Execute the task with maximum number of steps"""
+		start_time = time.time()
+		timing_logs = []
+		
+		def log_timing(operation: str, start_time: float):
+			current_time = time.time()
+			elapsed = current_time - start_time
+			timing_logs.append(f"{operation}: {elapsed:.2f}s")
+			print(f"[Timing] {operation}: {elapsed:.2f}s")
+			return current_time
 
 		loop = asyncio.get_event_loop()
 		agent_run_error: str | None = None  # Initialize error tracking variable
 		self._force_exit_telemetry_logged = False  # ADDED: Flag for custom telemetry on force exit
 
 		# Set up the Ctrl+C signal handler with callbacks specific to this agent
+		signal_setup_start = time.time()
 		from browser_use.utils import SignalHandler
 
 		# Define the custom exit callback function for second CTRL+C
@@ -875,20 +935,30 @@ class Agent(Generic[Context]):
 			exit_on_second_int=True,
 		)
 		signal_handler.register()
+		signal_setup_end = log_timing("Signal handler setup", signal_setup_start)
 
 		try:
+			agent_run_start = time.time()
 			self._log_agent_run()
+			agent_run_end = log_timing("Agent run initialization", agent_run_start)
 
 			# Execute initial actions if provided
 			if self.initial_actions:
+				initial_actions_start = time.time()
 				result = await self.multi_act(self.initial_actions, check_for_new_elements=False)
 				self.state.last_result = result
+				initial_actions_end = log_timing("Initial actions execution", initial_actions_start)
 
+			step_loop_start = time.time()
 			for step in range(max_steps):
+				step_iteration_start = time.time()
+				
 				# Check if waiting for user input after Ctrl+C
 				if self.state.paused:
+					pause_start = time.time()
 					signal_handler.wait_for_resume()
 					signal_handler.reset()
+					pause_end = log_timing(f"Step {step} - Pause handling", pause_start)
 
 				# Check if we should stop due to too many failures
 				if self.state.consecutive_failures >= self.settings.max_failures:
@@ -909,21 +979,34 @@ class Agent(Generic[Context]):
 						break
 
 				if on_step_start is not None:
+					step_start_callback_start = time.time()
 					await on_step_start(self)
+					step_start_callback_end = log_timing(f"Step {step} - Step start callback", step_start_callback_start)
 
 				step_info = AgentStepInfo(step_number=step, max_steps=max_steps)
+				
+				step_execution_start = time.time()
 				await self.step(step_info)
+				step_execution_end = log_timing(f"Step {step} - Step execution", step_execution_start)
 
 				if on_step_end is not None:
+					step_end_callback_start = time.time()
 					await on_step_end(self)
+					step_end_callback_end = log_timing(f"Step {step} - Step end callback", step_end_callback_start)
 
 				if self.state.history.is_done():
+					validation_start = time.time()
 					if self.settings.validate_output and step < max_steps - 1:
 						if not await self._validate_output():
 							continue
+					validation_end = log_timing(f"Step {step} - Output validation", validation_start)
 
+					completion_start = time.time()
 					await self.log_completion()
+					completion_end = log_timing(f"Step {step} - Completion logging", completion_start)
 					break
+				
+				step_iteration_end = log_timing(f"Step {step} - Total iteration time", step_iteration_start)
 			else:
 				agent_run_error = 'Failed to complete task in maximum steps'
 
@@ -944,6 +1027,7 @@ class Agent(Generic[Context]):
 
 				logger.info(f'❌ {agent_run_error}')
 
+			step_loop_end = log_timing("Total step loop execution", step_loop_start)
 			return self.state.history
 
 		except KeyboardInterrupt:
@@ -958,20 +1042,21 @@ class Agent(Generic[Context]):
 			raise e
 
 		finally:
+			cleanup_start = time.time()
 			# Unregister signal handlers before cleanup
 			signal_handler.unregister()
 
 			if not self._force_exit_telemetry_logged:  # MODIFIED: Check the flag
 				try:
+					telemetry_start = time.time()
 					self._log_agent_event(max_steps=max_steps, agent_run_error=agent_run_error)
 					logger.info('Agent run telemetry logged.')
+					telemetry_end = log_timing("Telemetry logging", telemetry_start)
 				except Exception as log_e:  # Catch potential errors during logging itself
 					logger.error(f'Failed to log telemetry event: {log_e}', exc_info=True)
-			else:
-				# ADDED: Info message when custom telemetry for SIGINT was already logged
-				logger.info('Telemetry for force exit (SIGINT) was logged by custom exit callback.')
 
 			if self.settings.save_playwright_script_path:
+				script_save_start = time.time()
 				logger.info(
 					f'Agent run finished. Attempting to save Playwright script to: {self.settings.save_playwright_script_path}'
 				)
@@ -985,18 +1070,32 @@ class Agent(Generic[Context]):
 						browser_config=self.browser.config,
 						context_config=self.browser_context.config,
 					)
+					script_save_end = log_timing("Playwright script saving", script_save_start)
 				except Exception as script_gen_err:
 					# Log any error during script generation/saving
 					logger.error(f'Failed to save Playwright script: {script_gen_err}', exc_info=True)
 
+			close_start = time.time()
 			await self.close()
+			close_end = log_timing("Resource cleanup", close_start)
 
 			if self.settings.generate_gif:
+				gif_start = time.time()
 				output_path: str = 'agent_history.gif'
 				if isinstance(self.settings.generate_gif, str):
 					output_path = self.settings.generate_gif
 
 				create_history_gif(task=self.task, history=self.state.history, output_path=output_path)
+				gif_end = log_timing("GIF generation", gif_start)
+
+			# Log final timing summary
+			print("\n=== Timing Summary ===")
+			for log in timing_logs:
+				print(log)
+			print(f"Total execution time: {time.time() - start_time:.2f}s")
+			
+			# Log to CSV with final flag
+			log_timing_to_csv(timing_logs, 'service_run', self.task_id, self.run_id, is_final=True)
 
 	# @observe(name='controller.multi_act')
 	@time_execution_async('--multi-act (agent)')
