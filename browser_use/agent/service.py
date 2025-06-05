@@ -10,6 +10,7 @@ import time
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any, Generic, TypeVar
+from datetime import datetime
 
 from dotenv import load_dotenv
 from langchain_core.language_models.chat_models import BaseChatModel
@@ -62,8 +63,19 @@ from browser_use.telemetry.views import (
 )
 from browser_use.utils import check_env_variables, time_execution_async, time_execution_sync
 
-# Import the CSV logging utility
-from server.utils import log_timing_to_csv
+# Find project root by traversing up until we find the shared directory
+current_dir = os.path.dirname(os.path.abspath(__file__))
+project_root = current_dir
+while not os.path.exists(os.path.join(project_root, 'shared')):
+	parent = os.path.dirname(project_root)
+	if parent == project_root:  # Reached root directory
+		raise ImportError("Could not find project root directory containing 'shared' folder")
+	project_root = parent
+
+if project_root not in sys.path:
+	sys.path.append(project_root)
+
+from shared.utils.timing import log_timing_to_csv
 
 load_dotenv()
 logger = logging.getLogger(__name__)
