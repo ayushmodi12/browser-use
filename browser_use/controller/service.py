@@ -888,7 +888,7 @@ class Controller(Generic[Context]):
 			await page.keyboard.press('Home')  # move cursor to the top left of the sheet first
 			await page.keyboard.press('ArrowUp')
 			await asyncio.sleep(0.1)
-			await page.keyboard.press('Control+G')  # open the goto range popup
+			await page.keyboard.press('Control+J')  # open the goto range popup
 			await asyncio.sleep(0.2)
 			await page.keyboard.type(cell_or_range, delay=0.05)
 			await asyncio.sleep(0.2)
